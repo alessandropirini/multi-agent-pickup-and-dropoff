@@ -1,12 +1,69 @@
 import math
+from dataclasses import dataclass
+
 import shapely
 import numpy as np
+from dg_commons import PlayerName
 from dg_commons.sim import InitSimGlobalObservations
+from numpydantic import NDArray
+from pydantic import BaseModel
 from scipy.sparse import csr_array as CSR
 from scipy.stats import qmc
 from scipy.spatial import KDTree as KDT
 import scipy.sparse
-from pdm4ar.exercises.ex14.agent import Pdm4arAgentParams
+from scipy.sparse.csgraph import shortest_path as scipy_shortest_path
+
+
+class GlobalPlanMessage(BaseModel):
+    per_agent_tasks: dict[str, list[tuple[str, str]]]
+    global_agent_priorities: dict[str, int]
+    per_agent_paths: dict[PlayerName, list[tuple[float, float]]]
+    per_agent_flags: dict[PlayerName, list[int]]
+    vertices: NDArray
+    goals: int
+
+
+@dataclass(frozen=True)
+class Pdm4arAgentParams:
+    param1: float = 10
+    # Turn-in-PLace (TiP) CONTROLLER PARAMS
+    angular_tol: float = 0.01  # Tolerance for angular position error when turning in place
+    pos_tol: float = 0.05  # Tolerance for position to follow next checkpoint
+    kp_pos: float = 20.0  # Kp parameter of P controller for position
+    kp_lat: float = 2.0  # Kp parameter of P controller for lateral deviation
+    kp_omega: float = 5.0  # Kp parameter of P controller for hea
+    kp_omega_in_place: float = 2.0
+    # Pure - Pursuit (PP) parameters
+    window_r: int = 6  # number of sampled points from the path to check circle-line intersections
+    look_ahead_d_start: float = 0.5  # look-ahead standard radius for PP controller
+
+    collection_radius: float = 0.3  # Placeholder for goal collection points radius
+    eps: float = 1e-2  # tolerance for checking point inclusion in in line-segment intersections
+    collection_eps: float = collection_radius / 2  # tolerance for collection
+
+    # ONLINE AVOIDANCE paramaters
+    r_agent = 0.6
+    obst_eps_buffer = 0.2
+    r_priority: float = 2.5  # radius inside which obstacle avoidance is used to stop the lower priority robot
+    r_fallback: float = 2  # radius inside which obstacle avoidance is used to reverse the lower priority robot
+    r_bad: float = 1.5  # radius inside which obstacle avoidance is used to stop the higher priority robot
+    vision_cone: float = (
+        np.pi / 2
+    )  # the angle from center in which agent detections count (only look for agents +- angle from direction of movement)
+    sampling_eps_forward = 0.1  # sampling distance to the lookahead radius away from agent
+    sampling_eps_backwards = 0.35  # sampling distance to the lookahead radius towards agent
+    reversing_timesteps = 12  # number of timestep to reverse after dropping off all the goals
+
+
+@dataclass
+class RobotInitState:
+    x: float
+    y: float
+    psi: float
+    radius: float
+    wheelbase: float
+    wheelradius: float
+    limits: object
 
 params = Pdm4arAgentParams()
 
@@ -28,6 +85,100 @@ def switch_gears(switched: int | bool, omega_1: float, omega_2: float):
         return omega_1_new, omega_2_new
     else:
         return omega1_temp, omega2_temp
+
+
+def wheel_speeds_to_target(
+    target_pt: np.ndarray,
+    current_pos: np.ndarray,
+    current_heading: float,
+    params: Pdm4arAgentParams,
+    wheelbase: float,
+    wheelradius: float,
+    v_max: float,
+) -> tuple[float, float]:
+    p_to_t_vec = target_pt - current_pos
+    theta = np.arctan2(p_to_t_vec[1], p_to_t_vec[0])
+    delta = to_pi_minus_pi(theta - current_heading)
+    dtheta = params.kp_omega * delta
+    omega = (wheelbase / (2 * wheelradius)) * dtheta
+
+    u = v_max / wheelradius
+    u -= abs(omega)
+    return u - omega, u + omega
+
+
+def buffered_obstacle_tree(static_obstacles, buffer_radius: float) -> shapely.STRtree:
+    obstacles = [obstacle.shape.buffer(buffer_radius) for obstacle in static_obstacles]
+    return shapely.STRtree(obstacles)
+
+
+def polygon_center_radius(polygon) -> tuple[np.ndarray, np.ndarray]:
+    center = np.array([polygon.centroid.x, polygon.centroid.y])
+    radius = np.linalg.norm(center[None, :] - polygon.exterior.coords[0], axis=1)
+    return center, radius
+
+
+def closest_point_in_distance_band(
+    points: list[np.ndarray],
+    current_pos: np.ndarray,
+    target_distance: float,
+    band: float,
+) -> np.ndarray | None:
+    if not points:
+        return None
+
+    pts = np.stack(points, axis=0)
+    dists = np.linalg.norm(pts - current_pos, axis=1)
+    mask = (dists >= target_distance - band) & (dists <= target_distance + band)
+    candidate_idx = np.where(mask)[0]
+
+    if len(candidate_idx) > 0:
+        inside_dists = dists[candidate_idx]
+        best_inside = candidate_idx[np.argmin(np.abs(inside_dists - target_distance))]
+        return pts[best_inside]
+
+    best_idx = np.argmin(np.abs(dists - target_distance))
+    return pts[best_idx]
+
+
+def task_indices(
+    agents: list,
+    goals: list,
+    dropoffs: list,
+) -> tuple[dict, set, dict, set, dict]:
+    n_agents = len(agents)
+    n_goals = len(goals)
+
+    agent2idx = dict(zip(agents, range(n_agents)))
+    agents_set = set(agents)
+    goal2idx = dict(zip(goals, range(n_agents, n_agents + n_goals)))
+    goals_set = set(goals)
+    dropoff2idx = dict(zip(dropoffs, range(n_agents + n_goals, n_agents + n_goals + len(dropoffs))))
+    return agent2idx, agents_set, goal2idx, goals_set, dropoff2idx
+
+
+def route_distance(task_graph, agent, route) -> float:
+    dist = 0
+    prev = agent
+    for stop in route:
+        if prev == stop[0]:
+            continue
+        if task_graph.has_edge(prev, stop[0]):
+            dist += task_graph[prev][stop[0]]["weight"]
+        prev = stop[0]
+    return dist
+
+
+def route_label(route) -> str:
+    path = []
+    for stop in route:
+        path.append(stop[0])
+        path.append(stop[1])
+    return " -> ".join(path)
+
+
+def shortest_distance(graph, source_idx: int, target_idx: int) -> float:
+    return scipy_shortest_path(graph, method="auto", directed=True, indices=[source_idx])[0, target_idx]
 
 
 def priority(c_agent_goal: bool, o_agent_goal: bool, c_agent_priority: int, o_agent_priority) -> bool:

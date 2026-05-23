@@ -1,7 +1,5 @@
-from dataclasses import dataclass
-from mimetypes import init
-import json
 from typing import Sequence
+
 from dg_commons import PlayerName
 from dg_commons.sim import InitSimGlobalObservations, InitSimObservations, SimObservations
 from dg_commons.sim.agents import Agent, GlobalPlanner
@@ -9,8 +7,6 @@ from dg_commons.sim.goals import PlanningGoal
 from dg_commons.sim.models.diff_drive import DiffDriveCommands
 from dg_commons.sim.models.diff_drive_structures import DiffDriveGeometry, DiffDriveParameters
 from dg_commons.sim.models.obstacles import StaticObstacle
-from numpydantic import NDArray
-from pydantic import BaseModel
 import numpy as np
 import networkx as nx
 import scipy.optimize
@@ -20,71 +16,27 @@ import scipy.sparse
 from scipy.spatial import KDTree as KDT
 from scipy.sparse.csgraph import shortest_path as scipy_shortest_path
 
-# if you put an auto import and this crashes I am going to lose my mind and please be lucky with the assignments, come onnnnnnn
-
-
-class GlobalPlanMessage(BaseModel):
-    per_agent_tasks: dict[str, list[tuple[str, str]]]
-    global_agent_priorities: dict[str, int]
-    per_agent_paths: dict[PlayerName, list[tuple[float, float]]]
-    per_agent_flags: dict[PlayerName, list[int]]
-    vertices: NDArray
-    goals: int
-
-
-@dataclass(frozen=True)
-class Pdm4arAgentParams:
-    param1: float = 10
-    # Turn-in-PLace (TiP) CONTROLLER PARAMS
-    angular_tol: float = 0.01  # Tolerance for angular position error when turning in place
-    pos_tol: float = 0.05  # Tolerance for position to follow next checkpoint
-    kp_pos: float = 20.0  # Kp parameter of P controller for position
-    kp_lat: float = 2.0  # Kp parameter of P controller for lateral deviation
-    kp_omega: float = 5.0  # Kp parameter of P controller for hea
-    kp_omega_in_place: float = 2.0
-    # Pure - Pursuit (PP) parameters
-    window_r: int = 6  # number of sampled points from the path to check circle-line intersections
-    look_ahead_d_start: float = 0.5  # look-ahead standard radius for PP controller
-
-    collection_radius: float = 0.3  # Placeholder for goal collection points radius
-    eps: float = 1e-2  # tolerance for checking point inclusion in in line-segment intersections
-    collection_eps: float = collection_radius / 2  # tolerance for collection
-
-    # ONLINE AVOIDANCE paramaters
-    r_agent = 0.6
-    obst_eps_buffer = 0.2
-    r_priority: float = 2.5  # radius inside which obstacle avoidance is used to stop the lower priority robot
-    r_fallback: float = 2  # radius inside which obstacle avoidance is used to reverse the lower priority robot
-    r_bad: float = 1.5  # radius inside which obstacle avoidance is used to stop the higher priority robot
-    vision_cone: float = (
-        np.pi / 2
-    )  # the angle from center in which agent detections count (only look for agents +- angle from direction of movement)
-    sampling_eps_forward = 0.1  # sampling distance to the lookahead radius away from agent
-    sampling_eps_backwards = 0.35  # sampling distance to the lookahead radius towards agent
-    reversing_timesteps = 12  # number of timestep to reverse after dropping off all the goals
-
 
 from pdm4ar.exercises.ex14.utils import (
-    to_pi_minus_pi,
-    sgn,
-    prm,
-    priority,
-    switch_gears,
-    sample_points,
+    GlobalPlanMessage,
+    Pdm4arAgentParams,
+    RobotInitState,
+    buffered_obstacle_tree,
+    closest_point_in_distance_band,
     line_circle_inter,
+    polygon_center_radius,
+    priority,
+    prm,
+    route_distance,
+    route_label,
+    sample_points,
+    shortest_distance,
+    switch_gears,
+    task_indices,
+    to_pi_minus_pi,
     valid_point,
+    wheel_speeds_to_target,
 )
-
-
-@dataclass
-class RobotInitState:
-    x: float
-    y: float
-    psi: float
-    radius: float
-    wheelbase: float
-    wheelradius: float
-    limits: object
 
 
 class Pdm4arAgent(Agent):
@@ -150,15 +102,12 @@ class Pdm4arAgent(Agent):
 
     def on_episode_init(self, init_sim_obs: InitSimObservations):
 
-        # FOR WHEN THE SCENARIO IS COMPLETELY EXTRACTED
         self.agent_name = init_sim_obs.my_name
         self.agent_id = self.agent_name[7:]
         self.agent_id = int(self.agent_id)
 
-        obstacles = []
-        for obstacle in list(init_sim_obs.dg_scenario.static_obstacles):
-            obstacles.append(obstacle.shape.buffer(self.params.r_agent + self.params.obst_eps_buffer))
-        self.obstacle_tree = shapely.STRtree(obstacles)
+        buffer_radius = self.params.r_agent + self.params.obst_eps_buffer
+        self.obstacle_tree = buffered_obstacle_tree(init_sim_obs.dg_scenario.static_obstacles, buffer_radius)
 
     def on_receive_global_plan(
         self,
@@ -486,29 +435,13 @@ class Pdm4arAgent(Agent):
         :return: angular velocity commands for the robot
         :rtype: ndarray[float, float]
         """
-        # CHECK AMONG THOSE THE CLOSEST TO BEING AT A LOOKAHEAD DISTANCE FROM THE ROBOT
-        if reversing_positions:
-            pts = np.stack(reversing_positions, axis=0)
-            dists = np.linalg.norm(pts - current_pos, axis=1)
-
-            # Indices whose distance is in the ring [0.5, 0.7]
-            mask = (dists >= self.params.look_ahead_d_start - self.params.sampling_eps_forward) & (
-                dists <= self.params.look_ahead_d_start + self.params.sampling_eps_forward
-            )
-            candidate_idx = np.where(mask)[0]
-            # Extract positions
-            if len(candidate_idx) > 0:
-                # pick the one closest to the target inside the band
-                inside_dists = dists[candidate_idx]
-                best_inside = candidate_idx[np.argmin(np.abs(inside_dists - self.params.look_ahead_d_start))]
-                candidate_target = pts[best_inside]
-            else:
-                # Fallback → pick point whose distance is closest to the target
-                best_idx = np.argmin(np.abs(dists - self.params.look_ahead_d_start))
-                candidate_target = pts[best_idx]
-
-        # Fallback
-        else:
+        candidate_target = closest_point_in_distance_band(
+            points=reversing_positions,
+            current_pos=current_pos,
+            target_distance=self.params.look_ahead_d_start,
+            band=self.params.sampling_eps_forward,
+        )
+        if candidate_target is None:
             print("RAN OUT OF CANDIDATES")
             candidate_target = self.path[self.c_wpt_idx]
 
@@ -533,20 +466,15 @@ class Pdm4arAgent(Agent):
         :param current_pos: Description
         :param current_heading: Description
         """
-        # HEADING CONTROLLER
-        p_to_t_vec = target_pt - current_pos
-        theta = np.arctan2(p_to_t_vec[1], p_to_t_vec[0])
-        delta = theta - current_heading
-        delta = to_pi_minus_pi(delta)
-        dtheta = self.params.kp_omega * delta
-        omega = (self.wheel_b / (2 * self.wheel_r)) * dtheta
-
-        # LINEAR VELOCITY CONTROLLER
-        u = self.v_max / self.wheel_r
-        u -= abs(omega)
-        omega_1 = u - omega
-        omega_2 = u + omega
-        return omega_1, omega_2
+        return wheel_speeds_to_target(
+            target_pt=target_pt,
+            current_pos=current_pos,
+            current_heading=current_heading,
+            params=self.params,
+            wheelbase=self.wheel_b,
+            wheelradius=self.wheel_r,
+            v_max=self.v_max,
+        )
 
 
 class Pdm4arGlobalPlanner(GlobalPlanner):
@@ -643,11 +571,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # ------------GET DROP-oFF POSITIONS------------ #
         self.dropoffs = list(init_sim_obs.collection_points.keys())
         dropoff_infos = list(init_sim_obs.collection_points.values())
-        center = np.ndarray((1, 2))
         for dropoff_name, dropoff in zip(self.dropoffs, dropoff_infos):
-            poly = dropoff.polygon
-            center = np.array([poly.centroid.x, poly.centroid.y])
-            radius = np.linalg.norm(center[None, :] - poly.exterior.coords[0], axis=1)
+            center, radius = polygon_center_radius(dropoff.polygon)
             collected_goals = dropoff.collected_goals  # might be useless
             self.deposit_locations[dropoff_name] = (center, collected_goals, radius)
 
@@ -655,9 +580,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.goals = list(init_sim_obs.shared_goals.keys())
         goal_values = list(init_sim_obs.shared_goals.values())
         for goal_id, collection in zip(self.goals, goal_values):
-            poly = collection.polygon
-            center = np.array([poly.centroid.x, poly.centroid.y])
-            radius = np.linalg.norm(poly.exterior.coords[0] - center[None, :], axis=1)
+            center, radius = polygon_center_radius(collection.polygon)
             id_collector = collection.collected_by
             # there is also collection time and delivery time, if we want to make things fancy in the implementation
             self.goal_information[goal_id] = {"pos": center, "id_collector": id_collector, "radius": radius}
@@ -683,93 +606,56 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         current lowest workload to minimize total makespan.
         """
 
-        # define agents and corrisponding indices in the scipy graph
-        n_agents = len(self.agents)
-        agent2idx = dict(zip(self.agents, range(n_agents)))
-        agents_set = set(self.agents)
+        agent2idx, agents_set, goal2idx, goals_set, dropoff2idx = task_indices(
+            self.agents, self.goals, self.dropoffs
+        )
 
-        # define goal  locations and corrisponding indices in the scipy graph
-        n_goals = len(self.goals)
-        goal2idx = dict(zip(self.goals, range(n_agents, n_agents + n_goals)))
-        goals_set = set(self.goals)
+        self.goal_idx_set = set(goal2idx.values())
 
-        self.goal_idx_set = set(range(n_agents, n_agents + n_goals))
-
-        # define dropoff locations and corrisponding indices in the scipy graph
-        n_dropoffs = len(self.dropoffs)
-        dropoff2idx = dict(zip(self.dropoffs, range(n_agents + n_goals, n_agents + n_goals + n_dropoffs)))
-
-        # create np adjacency matrix used for computing task assignment
-        task_graph_np = np.zeros((n_agents + n_goals, n_agents + n_goals))
         task_graph = nx.DiGraph()
-
-        # add agents and goals as vertices
         task_graph.add_nodes_from([*agents_set, *goals_set])
 
         # add weighted edges between all vertices
         for u_agent in agents_set:
-            u_idx = agent2idx[u_agent]
-
             # agent-agent edges with weight zero
             for v_agent in agents_set - {u_agent}:
-                v_idx = agent2idx[v_agent]
-                weight = 0
-                task_graph.add_edge(u_agent, v_agent, weight=weight)
-                task_graph_np[u_idx, v_idx] = weight
+                task_graph.add_edge(u_agent, v_agent, weight=0)
 
             # agent-task edges with weight corrisponding to distance from agent to starting point of task
             for v_goal in goals_set:
-                v_idx = goal2idx[v_goal]
-                weight = scipy_shortest_path(
-                    warehouse_graph, method="auto", directed=True, indices=[agent2idx[u_agent]]
-                )[0, goal2idx[v_goal]]
+                weight = shortest_distance(warehouse_graph, agent2idx[u_agent], goal2idx[v_goal])
                 task_graph.add_edge(u_agent, v_goal, weight=weight)
-                task_graph_np[u_idx, v_idx] = weight
 
         for u_goal in goals_set:
-            u_idx = goal2idx[u_goal]
-
             # task-agent edges with weight corrisponding to distance to complete task (pickup -> dropoff)
             for v_agent in agents_set:
-                v_idx = agent2idx[v_agent]
-
                 # find the optimal dropoff
                 shortest_len = np.inf
                 shortest_id = self.dropoffs[0]
                 for dropoff in self.dropoffs:
-                    this_len = scipy_shortest_path(
-                        warehouse_graph, method="auto", directed=True, indices=[goal2idx[u_goal]]
-                    )[0, dropoff2idx[dropoff]]
+                    this_len = shortest_distance(warehouse_graph, goal2idx[u_goal], dropoff2idx[dropoff])
                     if this_len < shortest_len:
                         shortest_len = this_len
                         shortest_id = dropoff
 
                 # add edge with label corrisponding to dropoff location
                 task_graph.add_edge(u_goal, v_agent, weight=shortest_len, label=shortest_id)
-                task_graph_np[u_idx, v_idx] = weight
 
             # task-task edges with weight corrisponding to distance to complete current task (pickup -> dropoff),
             # plus distance to next task
             for v_goal in goals_set - {u_goal}:
-                v_idx = goal2idx[v_goal]
-
                 # find the optimal dropoff
                 shortest_len = np.inf
                 shortest_id = self.dropoffs[0]
                 for dropoff in self.dropoffs:
-                    this_len = scipy_shortest_path(
-                        warehouse_graph, method="auto", directed=True, indices=[goal2idx[u_goal]]
-                    )[0, dropoff2idx[dropoff]]
-                    this_len += scipy_shortest_path(
-                        warehouse_graph, method="auto", directed=True, indices=[dropoff2idx[dropoff]]
-                    )[0, goal2idx[v_goal]]
+                    this_len = shortest_distance(warehouse_graph, goal2idx[u_goal], dropoff2idx[dropoff])
+                    this_len += shortest_distance(warehouse_graph, dropoff2idx[dropoff], goal2idx[v_goal])
                     if this_len < shortest_len:
                         shortest_len = this_len
                         shortest_id = dropoff
 
                 # add edge with label corrisponding to dropoff location
                 task_graph.add_edge(u_goal, v_goal, weight=shortest_len, label=shortest_id)
-                task_graph_np[u_idx, v_idx] = weight
 
         # save graph
         # nx.write_weighted_edgelist(task_graph, "task_graph_nx.edgelist")
@@ -787,9 +673,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 best_dropoff = "dummy_dropoff"
                 for dropoff in self.dropoffs:
                     idx_dropoff = dropoff2idx[dropoff]
-                    dist = scipy_shortest_path(warehouse_graph, method="auto", directed=True, indices=[idx_goal])[
-                        0, idx_dropoff
-                    ]
+                    dist = shortest_distance(warehouse_graph, idx_goal, idx_dropoff)
                     if dist < min_dist:
                         min_dist = dist
                         best_dropoff = dropoff
@@ -836,20 +720,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         print("\n**********TASK ASSIGNMENTS**********")
         for agent in self.agents:
             route = best_assignments[agent]
-            path = []
-            dist = 0
-            prev = agent
-            for stop in route:
-                path.append(stop[0])
-                path.append(stop[1])
-                if prev == stop[0]:
-                    continue
-                # Note: This distance print might be slightly inaccurate now due to graph changes
-                # but functionally irrelevant to the robot operation
-                if task_graph.has_edge(prev, stop[0]):
-                    dist += task_graph[prev][stop[0]]["weight"]
-                prev = stop[0]
-            print(f"{agent} - {dist}:\t{' -> '.join(path)}")
+            dist = route_distance(task_graph, agent, route)
+            print(f"{agent} - {dist}:\t{route_label(route)}")
         print("************************************\n")
 
         print("\n************PRIORITIES************")
@@ -880,12 +752,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     for goal in goals_per_dropoff:
                         # calculate distance agent->goal->dropoff
                         idx_goal = goal2idx[goal]
-                        dist = scipy_shortest_path(warehouse_graph, method="auto", directed=True, indices=[idx_agent])[
-                            0, idx_goal
-                        ]
-                        dist += scipy_shortest_path(warehouse_graph, method="auto", directed=True, indices=[idx_goal])[
-                            0, idx_dropoff
-                        ]
+                        dist = shortest_distance(warehouse_graph, idx_agent, idx_goal)
+                        dist += shortest_distance(warehouse_graph, idx_goal, idx_dropoff)
                         # save if it is current best
                         if dist < min_dist:
                             min_dist = dist
@@ -893,9 +761,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     agent_dropoff_mat[i, j] = min_dist
                 # if no goals are assigned to a dropoff, the value is the distance to the dropoff
                 else:
-                    dist = scipy_shortest_path(warehouse_graph, method="auto", directed=True, indices=[idx_agent])[
-                        0, idx_dropoff
-                    ]
+                    dist = shortest_distance(warehouse_graph, idx_agent, idx_dropoff)
                     agent_dropoff_mat[i, j] = dist
         mat_for_extra_dropoffs = agent_dropoff_mat.copy()
 
@@ -931,21 +797,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # calculate priorities
         agent2dist = {}
         for agent in self.agents:
-            route = best_assignments[agent]
-            path = []
-            dist = 0
-            prev = agent
-            for stop in route:
-                path.append(stop[0])
-                path.append(stop[1])
-                if prev == stop[0]:
-                    continue
-                # Note: This distance print might be slightly inaccurate now due to graph changes
-                # but functionally irrelevant to the robot operation
-                if task_graph.has_edge(prev, stop[0]):
-                    dist += task_graph[prev][stop[0]]["weight"]
-                prev = stop[0]
-            agent2dist[agent] = dist
+            agent2dist[agent] = route_distance(task_graph, agent, best_assignments[agent])
 
         agent_dist_list = sorted(agent2dist.items(), key=lambda x: x[1])
         priorities = {PlayerName(item[0]): i for i, item in enumerate(agent_dist_list)}
@@ -986,17 +838,15 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                         g2drp = np.inf
                         old_g2drp = np.inf
                         for item in agents2goaldropoff[agent2]:
-                            potential_new_drop = scipy_shortest_path(
-                                warehouse_graph, method="auto", directed=True, indices=[goal2idx[goal_1]]
-                            )[0, dropoff2idx[item[1]]]
+                            potential_new_drop = shortest_distance(
+                                warehouse_graph, goal2idx[goal_1], dropoff2idx[item[1]]
+                            )
                             if potential_new_drop < g2drp:
                                 dropoff_to = item[1]
                                 g2drp = potential_new_drop
 
                         for item in agents2goaldropoff[agent1]:
-                            old_dist = scipy_shortest_path(
-                                warehouse_graph, method="auto", directed=True, indices=[goal2idx[goal_1]]
-                            )[0, dropoff2idx[item[1]]]
+                            old_dist = shortest_distance(warehouse_graph, goal2idx[goal_1], dropoff2idx[item[1]])
                             if old_dist < old_g2drp:
                                 dropoff_from = item[1]
                                 old_g2drp = old_dist
@@ -1004,9 +854,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                         if potential_new_drop > self.swap_factor * old_dist:
                             continue
                         # get the cost of the robot to go from
-                        robot_cost = scipy_shortest_path(
-                            warehouse_graph, method="auto", directed=True, indices=[goal2idx[goal_1]]
-                        )[0, agent2idx[agent2]]
+                        robot_cost = shortest_distance(warehouse_graph, goal2idx[goal_1], agent2idx[agent2])
                         # upload the closest goal and cost
                         if robot_cost < best_cost:
                             best_cost = robot_cost
@@ -1025,18 +873,16 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                         g2drp = np.inf
                         old_g2drp = np.inf
                         for item in agents2goaldropoff[agent1]:
-                            potential_new_drop = scipy_shortest_path(
-                                warehouse_graph, method="auto", directed=True, indices=[goal2idx[goal_2]]
-                            )[0, dropoff2idx[item[1]]]
+                            potential_new_drop = shortest_distance(
+                                warehouse_graph, goal2idx[goal_2], dropoff2idx[item[1]]
+                            )
                             # update lowest distance
                             if potential_new_drop < g2drp:
                                 dropoff_to = item[1]
                                 g2drp = potential_new_drop
 
                         for item in agents2goaldropoff[agent2]:
-                            old_dist = scipy_shortest_path(
-                                warehouse_graph, method="auto", directed=True, indices=[goal2idx[goal_2]]
-                            )[0, dropoff2idx[item[1]]]
+                            old_dist = shortest_distance(warehouse_graph, goal2idx[goal_2], dropoff2idx[item[1]])
                             # update lowest distance
                             if old_dist < old_g2drp:
                                 dropoff_from = item[1]
@@ -1045,9 +891,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                         if potential_new_drop > self.swap_factor * old_dist:
                             continue
                         # get the cost of the robot to go from
-                        robot_cost = scipy_shortest_path(
-                            warehouse_graph, method="auto", directed=True, indices=[goal2idx[goal_2]]
-                        )[0, agent2idx[agent1]]
+                        robot_cost = shortest_distance(warehouse_graph, goal2idx[goal_2], agent2idx[agent1])
                         # upload the closest goal and cost
                         if robot_cost < best_cost:
                             best_cost = robot_cost
