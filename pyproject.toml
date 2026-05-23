@@ -7,7 +7,7 @@ name = "pdm4ar"
 version = "2025.0.0"
 authors = ["IDSC Frazzoli <yuesli@ethz.ch>"]
 
-description = "Exercises for the course Planning and Decision Making for Autonomous Robots at ETH Zurich"
+description = "Exercise 14 multi-agent collection implementation for PDM4AR"
 readme = "README.md"
 packages = [{ include = "pdm4ar", from = "src" }]
 
@@ -55,7 +55,7 @@ casadi = "3.6.5"
 sympy = "1.13.0"
 cloudpickle = "3.1.2"
 
-# notebooks
+# interactive debugging
 ipython = "8.26.0"
 ipykernel = "6.29.5"
 

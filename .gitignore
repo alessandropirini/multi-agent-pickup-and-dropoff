@@ -2,6 +2,9 @@
 out-docker/
 out/
 cache/
+prm_graph.npz
+prm_vertices.npy
+task_graph_nx.edgelist
 
 # Pycharm
 .idea/
